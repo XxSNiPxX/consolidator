@@ -1,0 +1,22 @@
+python3 stream_all_chunks.py --rings-dir rings --poll-ms 50 --filter-file filters.json
+
+prints the live data
+
+
+
+
+ python3 stream_trades_compare_buffered.py --rings-dir rings --filter-file filters.json --outdir out --buffer-rows 50 --buffer-sec 5
+
+comapres and creates the csv
+
+
+ python3 plot_and_compare_with_offset.py --input ./out/ETHUSDT.csv --outdir plots --match-ms 500 --rolling-sec 30
+
+
+plots the graphs 
+
+
+python3 plot_metrics.py --metrics metrics.csv --outdir plots_metrics --rolling-sec 60
+
+
+plots metrics

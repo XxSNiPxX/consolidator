@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-stream_and_compare_trades_only.py
+stream_and_compare_combined.py
 
-Watches mmap chunk rings for trade records (kind=1 only),
-spawns Binance WS trade monitors for symbols in filters.json, writes per-symbol CSVs
-containing both mmap and WS trade rows, and emits comparison rows when a WS/mmap pair
+Watches mmap chunk rings (both snapshot(kind=0) and trade(kind=1) records),
+spawns Binance WS monitors for symbols in filters.json, writes per-symbol CSVs
+containing both mmap and WS rows, and emits comparison rows when a WS/mmap pair
 is matched within a time tolerance.
 
 Usage:
-    python3 stream_and_compare_trades_only.py --rings-dir rings --filter-file filters.json --outdir out --poll-ms 50 --match-ms 500
+    python3 stream_and_compare_combined.py --rings-dir rings --filter-file filters.json --outdir out --poll-ms 50 --match-ms 500
 
 CSV format (columns):
  ts_iso, symbol, source, subsource, kind, seq_or_id, px, sz, bid, ask, mid,
  recv_ts, ws_ts, arrival_ms, price_diff, matched_with, note
 
 - source: "mmap" | "ws" | "compare"
-- subsource: prefix for mmap or "trade" for ws
-- NOTE: bid/ask/mid are unused for trades and will be None.
+- subsource: prefix for mmap (ring path) or stream name for ws ("trade" or "bookTicker")
 """
 from __future__ import annotations
 import argparse, os, time, json, glob, mmap, struct, threading, queue, csv, traceback, asyncio
@@ -24,6 +23,9 @@ from collections import defaultdict, deque
 from datetime import datetime
 from typing import Dict, Any, Optional
 import websockets
+import zlib  # add at top of file
+
+CRC_LEN = 4
 
 # --- constants matching Rust mmap layout ---
 META_MAGIC = b"RINGV1\x00\x00"
@@ -64,6 +66,7 @@ def read_from_data(mm: mmap.mmap, cap: int, off: int, n: int) -> bytes:
     first = cap - off
     return mm[off:off+first] + mm[:n-first]
 
+
 def parse_record(data_mm: mmap.mmap, cap: int, off: int) -> Optional[Dict[str,Any]]:
     hdr = read_from_data(data_mm, cap, off, RECORD_HEADER_LEN)
     if len(hdr) < RECORD_HEADER_LEN:
@@ -75,19 +78,21 @@ def parse_record(data_mm: mmap.mmap, cap: int, off: int) -> Optional[Dict[str,An
     total = RECORD_HEADER_LEN + plen
     raw = read_from_data(data_mm, cap, off, total)
     body = raw[RECORD_HEADER_LEN:RECORD_HEADER_LEN+plen]
+    payload = None
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         payload = None
     return {"seq": int(seq), "kind": int(kind), "payload": payload}
-
-# --- ChunkWatcher: emits mmap_trade (kind==1) only ---
+# --- ChunkWatcher: emits mmap_book (kind==0) and mmap_trade (kind==1) ---
 class ChunkWatcher(threading.Thread):
     def __init__(self, prefix: str, out_q: queue.Queue, poll_ms: int = 50, filter_ref: dict = None):
         super().__init__(daemon=True)
         self.prefix = prefix
         self.out_q = out_q
         self.poll_ms = poll_ms
+        # filter_ref is expected to be the Controller.filters dict (shared reference)
+        # with keys "symbols" and "exchanges" mapping to sets (possibly empty).
         self.filter_ref = filter_ref
         self.stop_evt = threading.Event()
         self.meta_mm = self.data_mm = None
@@ -121,51 +126,94 @@ class ChunkWatcher(threading.Thread):
             except: pass
         self.meta_mm = self.data_mm = self.meta_f = self.data_f = None
 
-    def run(self):
-        self.reopen()
-        while not self.stop_evt.is_set():
-            if not self.meta_mm or not self.data_mm:
-                self.reopen(); time.sleep(0.2); continue
-            try:
-                hdr = read_meta_header(self.meta_mm)
-            except Exception:
-                self.close(); time.sleep(0.2); continue
-            seq_now = hdr["seq"]
-            if seq_now < self.last_seq:
-                self.last_seq = 0
-            if seq_now > self.last_seq:
-                for i in range(hdr["slots"]):
-                    try:
-                        off, ln, seq, kind = read_index_slot(self.meta_mm, i)
-                    except Exception:
-                        continue
-                    # trades only
-                    if seq > self.last_seq and kind == 1:
+        def run(self):
+            self.reopen()
+            while not self.stop_evt.is_set():
+                if not self.meta_mm or not self.data_mm:
+                    self.reopen(); time.sleep(0.2); continue
+                try:
+                    hdr = read_meta_header(self.meta_mm)
+                except Exception:
+                    self.close(); time.sleep(0.2); continue
+
+                seq_now = hdr["seq"]
+                slots = hdr["slots"]
+                # handle wrap / reinit
+                if seq_now < self.last_seq:
+                    self.last_seq = 0
+
+                if seq_now > self.last_seq:
+                    # iterate new seq values only
+                    start = self.last_seq + 1
+                    end = seq_now
+                    # safety cap to avoid runaway loops (if seq jumps huge)
+                    max_batch = 100_000
+                    if end - start > max_batch:
+                        start = end - max_batch
+                    for seq in range(start, end + 1):
+                        idx = seq % slots
+                        try:
+                            off, ln, slot_seq, kind = read_index_slot(self.meta_mm, idx)
+                        except Exception:
+                            continue
+                        # If slot_seq != seq, it means writer hasn't published this seq into this slot yet
+                        if slot_seq != seq:
+                            # skip: another seq occupies slot or not yet updated
+                            continue
+                        if kind not in (0, 1):
+                            continue
+                        # trade/book only
+                        if ln < RECORD_HEADER_LEN + CRC_LEN:
+                            continue
                         rec = parse_record(self.data_mm, self.cap, off)
-                        if rec and rec["seq"] == seq and isinstance(rec["payload"], dict):
-                            payload = rec["payload"]
-                            sym = (payload.get("asset") or payload.get("s") or payload.get("symbol") or "").upper()
+                        if not rec:
+                            continue
+                        # sanity: seq must match
+                        if rec.get("seq") != seq:
+                            continue
+                        payload = rec.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
 
-                            # filtering by symbol if provided
-                            allowed = True
-                            if self.filter_ref and self.filter_ref.get("symbols"):
-                                allowed = (sym in self.filter_ref.get("symbols"))
-                            if not allowed:
-                                continue
+                        sym = (payload.get("asset") or payload.get("s") or payload.get("symbol") or "").upper()
 
-                            rec["prefix"] = self.prefix
-                            self.out_q.put(("mmap_trade", rec))
+                        allowed = True
+                        if self.filter_ref and self.filter_ref.get("symbols"):
+                            allowed = (sym in self.filter_ref.get("symbols"))
+                        if not allowed:
+                            continue
 
+                        rec["prefix"] = self.prefix
+                        tag = "mmap_book" if kind == 0 else "mmap_trade"
+                        # push to controller queue
+                        self.out_q.put((tag, rec))
+
+                        # optional logs
+                        if kind == 0:
+                            bid = payload.get("b") or payload.get("bid") or payload.get("best_bid")
+                            ask = payload.get("a") or payload.get("ask") or payload.get("best_ask")
+                            mid = None
+                            try:
+                                b = float(bid) if bid is not None else None
+                                a = float(ask) if ask is not None else None
+                                if b is not None and a is not None:
+                                    mid = 0.5*(b+a)
+                            except Exception:
+                                mid = None
+                            print(f"{iso_now()} [mmap-book] prefix={self.prefix} seq={seq} symbol={sym} bid={bid} ask={ask} mid={mid}")
+                        else:
                             px = payload.get("px") or payload.get("p") or payload.get("price")
                             sz = payload.get("sz") or payload.get("q") or payload.get("size")
                             print(f"{iso_now()} [mmap-trade] prefix={self.prefix} seq={seq} symbol={sym} px={px} sz={sz}")
-                self.last_seq = seq_now
-            time.sleep(self.poll_ms/1000.0)
+
+                    self.last_seq = seq_now
+
+                time.sleep(self.poll_ms/1000.0)
 
     def stop(self):
         self.stop_evt.set()
 
-# --- Binance websocket monitor subscribing to trade only ---
+# --- Binance websocket monitor subscribing to trade + bookTicker for a symbol ---
 class BinanceWSMonitor:
     def __init__(self, symbol: str, out_q: queue.Queue):
         self.symbol = symbol.lower()
@@ -182,7 +230,7 @@ class BinanceWSMonitor:
 
     async def _ws_main(self):
         base = "wss://stream.binance.com:9443"
-        streams = f"{self.symbol}@trade"
+        streams = f"{self.symbol}@trade/{self.symbol}@bookTicker"
         url = f"{base}/stream?streams={streams}"
         backoff = 0.1
         while not self._stop.is_set():
@@ -197,8 +245,8 @@ class BinanceWSMonitor:
                             continue
                         data = obj.get("data") if isinstance(obj, dict) and "data" in obj else obj
                         if not data: continue
-                        # trade message
-                        if "p" in data and "q" in data:
+                        # detect trade or bookTicker by fields
+                        if "p" in data and "q" in data:  # trade
                             sym = (data.get("s") or "").upper()
                             px = safe_float(data.get("p"))
                             sz = safe_float(data.get("q"))
@@ -207,7 +255,20 @@ class BinanceWSMonitor:
                             payload = {"symbol": sym, "px": px, "sz": sz, "ws_ts": ws_ts, "trade_id": trade_id}
                             self.out_q.put(("ws_trade", payload))
                             print(f"{iso_now()} [ws-trade] symbol={sym} px={px} sz={sz} trade_id={trade_id}")
+                        elif "b" in data and "a" in data:  # bookTicker
+                            sym = (data.get("s") or "").upper()
+                            bid = data.get("b"); ask = data.get("a")
+                            mid = None
+                            try:
+                                b = float(bid); a = float(ask); mid = 0.5*(b+a)
+                            except Exception:
+                                mid = None
+                            ws_ts = data.get("E") or int(time.time()*1000)
+                            payload = {"symbol": sym, "bid": bid, "ask": ask, "mid": mid, "ws_ts": ws_ts}
+                            self.out_q.put(("ws_book", payload))
+                            print(f"{iso_now()} [ws-book] symbol={sym} bid={bid} ask={ask} mid={mid}")
                         else:
+                            # unknown
                             continue
             except Exception as e:
                 print(f"{iso_now()} [ws:{self.symbol}] connection error: {e}; reconnect in {backoff}s")
@@ -217,18 +278,19 @@ class BinanceWSMonitor:
     def stop(self):
         self._stop.set()
 
-# --- Buffered CSV writer & compare engine (trades only) ---
+# --- Buffered CSV writer & compare engine ---
 class TradeCompareEngine:
     def __init__(self, outdir="out", buffer_rows=50, buffer_sec=5, fsync=False, match_ms=500):
         self.outdir = outdir; os.makedirs(self.outdir, exist_ok=True)
         self.buffer_rows = int(buffer_rows); self.buffer_sec = float(buffer_sec); self.fsync = bool(fsync)
         self.match_ms = int(match_ms)
         self.q = queue.Queue()
+        # windows hold recent events for matching
         self.windows = defaultdict(lambda: {"mmap": deque(maxlen=5000), "ws": deque(maxlen=5000)})
-        self.buffers = defaultdict(list)
+        self.buffers = defaultdict(list)    # symbol -> list[row]
         self.last_flush = defaultdict(lambda: time.time())
-        self.csv_handles = {}
-        self.csv_writers = {}
+        self.csv_handles = {}               # symbol -> file object (open)
+        self.csv_writers = {}               # symbol -> csv.writer
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -283,33 +345,41 @@ class TradeCompareEngine:
         print(f"{iso_now()} [flush] wrote rows for {s}")
 
     def _match_and_emit(self, symbol: str):
+        """
+        Attempt to match latest mmap vs ws event for symbol by timestamp proximity.
+        If found and not already matched, emit a compare row.
+        """
         win = self.windows[symbol]
         mmap_win = win["mmap"]
         ws_win = win["ws"]
         if not mmap_win or not ws_win:
             return
+        # pick most recent of each
         m = mmap_win[-1]
         w = ws_win[-1]
+        # determine timestamps (ms)
         m_ts = m.get("recv_ts") or m.get("arrival_ms") or 0
         w_ts = w.get("ws_ts") or w.get("arrival_ms") or 0
         if not m_ts or not w_ts:
             return
         dt = abs(int(w_ts) - int(m_ts))
         if dt <= self.match_ms:
+            # compute price values if present
             m_px = m.get("px")
-            w_px = w.get("px")
+            w_px = w.get("px") if "px" in w else w.get("mid")
             price_diff = None
             if m_px is not None and w_px is not None:
                 try:
                     price_diff = float(m_px) - float(w_px)
                 except Exception:
                     price_diff = None
+            # create compare row
             symbol_u = symbol.upper()
             crow = [
                 iso_now(), symbol_u, "compare", f"{m.get('prefix','mmap')}|ws",
                 2,  # kind=2 for compare
                 m.get("seq") or w.get("trade_id"),
-                m_px, m.get("sz"), None, None, None,  # bid/ask/mid unused
+                m_px, m.get("sz"), m.get("bid"), m.get("ask"), m.get("mid"),
                 m_ts, w_ts, int(time.time()*1000), price_diff, w.get("trade_id") or m.get("seq"), f"dt_ms={dt}"
             ]
             self._buffer_row(symbol_u, crow)
@@ -320,46 +390,78 @@ class TradeCompareEngine:
             try:
                 tag, rec = self.q.get(timeout=0.5)
             except queue.Empty:
+                # timed flush for all symbols
                 for s in list(self.buffers.keys()):
                     if self.buffers[s] and (time.time() - self.last_flush[s]) >= self.buffer_sec:
                         self._flush_symbol(s)
                 continue
             try:
                 now_ms = int(time.time()*1000)
-                if tag == "mmap_trade":
+                if tag in ("mmap_trade", "mmap_book"):
                     seq = rec.get("seq")
                     payload = rec.get("payload") or {}
                     prefix = rec.get("prefix")
                     symbol = (payload.get("asset") or payload.get("s") or payload.get("symbol") or "").upper()
                     if not symbol:
                         continue
-                    px = safe_float(payload.get("px") or payload.get("p") or payload.get("price"))
-                    sz = safe_float(payload.get("sz") or payload.get("q") or payload.get("size"))
-                    recv_ts = payload.get("recv_ts_ms") or payload.get("exchange_ts_ms") or None
+                    if tag == "mmap_trade":
+                        px = safe_float(payload.get("px") or payload.get("p") or payload.get("price"))
+                        sz = safe_float(payload.get("sz") or payload.get("q") or payload.get("size"))
+                        recv_ts = payload.get("recv_ts_ms") or payload.get("exchange_ts_ms") or None
+                        bid = ask = mid = None
+                    else:
+                        bid = payload.get("b") or payload.get("bid")
+                        ask = payload.get("a") or payload.get("ask")
+                        mid = None
+                        try:
+                            b = float(bid) if bid is not None else None
+                            a = float(ask) if ask is not None else None
+                            if b is not None and a is not None:
+                                mid = 0.5*(b+a)
+                        except Exception:
+                            mid = None
+                        px = mid; sz = None
+                        recv_ts = payload.get("recv_ts_ms") or payload.get("exchange_ts_ms") or None
 
+                    # store window entry
                     self.windows[symbol]["mmap"].append({
                         "seq": seq, "px": px, "sz": sz, "recv_ts": recv_ts,
-                        "prefix": prefix, "arrival_ms": now_ms
+                        "prefix": prefix, "arrival_ms": now_ms, "bid": bid, "ask": ask, "mid": mid
                     })
 
                     row = [
-                        iso_now(), symbol, "mmap", prefix, 1,
-                        seq, px, sz, None, None, None,
-                        recv_ts, None, now_ms, None, None, ""
+                        iso_now(), symbol, "mmap", prefix, 0 if tag=="mmap_book" else 1,
+                        seq, px, sz, bid, ask, mid, recv_ts, None, now_ms, None, None, ""
                     ]
                     self._buffer_row(symbol, row)
+                    # attempt match
                     self._match_and_emit(symbol)
 
-                elif tag == "ws_trade":
-                    symbol = (rec.get("symbol") or "").upper()
-                    px = safe_float(rec.get("px")); sz = safe_float(rec.get("sz"))
-                    ws_ts = rec.get("ws_ts") or int(time.time()*1000)
-                    trade_id = rec.get("trade_id")
-                    self.windows[symbol]["ws"].append({"trade_id": trade_id, "px": px, "sz": sz, "ws_ts": ws_ts, "arrival_ms": now_ms})
-                    row = [iso_now(), symbol, "ws", "trade", 1, trade_id, px, sz, None, None, None, None, ws_ts, now_ms, None, None, ""]
-                    self._buffer_row(symbol, row)
-                    self._match_and_emit(symbol)
-                    print(f"{iso_now()} [record] ws_trade symbol={symbol} trade_id={trade_id} px={px} sz={sz}")
+                elif tag in ("ws_trade", "ws_book"):
+                    if tag == "ws_trade":
+                        symbol = (rec.get("symbol") or "").upper()
+                        px = safe_float(rec.get("px")); sz = safe_float(rec.get("sz"))
+                        ws_ts = rec.get("ws_ts") or int(time.time()*1000)
+                        trade_id = rec.get("trade_id")
+                        sub = "trade"
+                        mid = None; bid = ask = None
+                        self.windows[symbol]["ws"].append({"trade_id": trade_id, "px": px, "sz": sz, "ws_ts": ws_ts, "arrival_ms": now_ms})
+                        row = [iso_now(), symbol, "ws", sub, 1, trade_id, px, sz, bid, ask, mid, None, ws_ts, now_ms, None, None, ""]
+                        self._buffer_row(symbol, row)
+                        self._match_and_emit(symbol)
+                        print(f"{iso_now()} [record] ws_trade symbol={symbol} trade_id={trade_id} px={px} sz={sz}")
+
+                    else:  # ws_book
+                        symbol = (rec.get("symbol") or rec.get("s") or "").upper()
+                        bid = rec.get("bid") or rec.get("b")
+                        ask = rec.get("ask") or rec.get("a")
+                        mid = rec.get("mid")
+                        ws_ts = rec.get("ws_ts") or int(time.time()*1000)
+                        self.windows[symbol]["ws"].append({"px": mid, "bid": bid, "ask": ask, "ws_ts": ws_ts, "arrival_ms": now_ms})
+                        row = [iso_now(), symbol, "ws", "bookTicker", 0, None, None, None, bid, ask, mid, None, ws_ts, now_ms, None, None, ""]
+                        self._buffer_row(symbol, row)
+                        self._match_and_emit(symbol)
+                        print(f"{iso_now()} [record] ws_book symbol={symbol} bid={bid} ask={ask} mid={mid}")
 
                 else:
                     pass
@@ -369,6 +471,7 @@ class TradeCompareEngine:
 
     def stop(self):
         self._stop.set()
+        # flush all remaining buffers synchronously
         for s in list(self.buffers.keys()):
             if self.buffers[s]:
                 self._flush_symbol(s)
@@ -385,6 +488,7 @@ class Controller:
         self.watchers: Dict[str, ChunkWatcher] = {}
         self.ws_monitors: Dict[str, BinanceWSMonitor] = {}
         self.engine = TradeCompareEngine(outdir=self.outdir, buffer_rows=buffer_rows, buffer_sec=buffer_sec, fsync=fsync, match_ms=match_ms)
+        # filters uses sets for fast membership checks
         self.filters = {"symbols": set(), "exchanges": set()}
         self._stop = threading.Event()
 
@@ -407,6 +511,7 @@ class Controller:
             prefixes.add(m[:-5])
         for p in sorted(prefixes):
             if p not in self.watchers:
+                # pass filter_ref so watchers can check allowed symbols live
                 w = ChunkWatcher(p, self.mmap_q, poll_ms=self.poll_ms, filter_ref=self.filters)
                 w.start(); self.watchers[p] = w
 
@@ -434,6 +539,7 @@ class Controller:
                     self.discover_and_spawn_watchers(); last_scan = now
                 if now - last_filter_load > 1.0:
                     self.load_filters(); last_filter_load = now
+                    # start/stop WS monitors based on filters
                     for sym in self.filters["symbols"]:
                         self.start_ws_for_symbol(sym)
                     for s in list(self.ws_monitors.keys()):
@@ -447,9 +553,11 @@ class Controller:
                     item = None
                 if item:
                     tag, rec = item
+                    # quick filter by symbol if filters present
                     payload = rec.get("payload", {}) if isinstance(rec, dict) else {}
                     symbol = (payload.get("asset") or payload.get("s") or payload.get("symbol") or "").upper()
                     if self.filters["symbols"] and symbol and symbol not in self.filters["symbols"]:
+                        # skip early
                         continue
                     self.engine.enqueue(tag, rec)
 
@@ -488,7 +596,7 @@ def parse_args():
     p.add_argument("--buffer-rows", type=int, default=50)
     p.add_argument("--buffer-sec", type=float, default=5.0)
     p.add_argument("--fsync", action="store_true", help="call fsync after each buffer flush")
-    p.add_argument("--match-ms", type=int, default=500, help="max ms difference to match mmap<>ws trades")
+    p.add_argument("--match-ms", type=int, default=500, help="max ms difference to match mmap<>ws events")
     return p.parse_args()
 
 def main():
@@ -501,6 +609,8 @@ def main():
         c.run()
     except KeyboardInterrupt:
         print("exiting")
+    finally:
+        pass
 
 if __name__ == "__main__":
     main()

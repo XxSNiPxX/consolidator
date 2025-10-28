@@ -20,3 +20,22 @@ python3 plot_metrics.py --metrics metrics.csv --outdir plots_metrics --rolling-s
 
 
 plots metrics
+
+
+g++ -std=c++17 mmap_trade_watcher.cpp -o mmap_trade_compare   -I/usr/include -I/usr/local/include   -lboost_system -lboost_thread -lssl -lcrypto -pthread
+
+
+c++ compile
+
+
+new wplots 
+
+python3 plot_and_compare_with_offset.py   --input ./out/ADAUSDT.csv   --outdir ./plots_ADA   --symbol ADAUSDT   --match-ms 500   --rolling-sec 30
+
+
+
+./mmap_trade_compare --rings rings --filters ./filters.json --out out
+
+ c++ run
+
+

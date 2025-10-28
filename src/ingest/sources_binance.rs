@@ -1,7 +1,6 @@
 // src/ingest/sources_binance.rs
-//! Binance ingestion: per-chunk websocket readers + per-chunk mmap ring writers.
-//! - computes meta_size with MmapRing::compute_meta_size for index_slots
-//! - preallocates data and meta files (posix_fallocate on unix when available)
+//! Binance ingestion: chunked websocket readers -> per-chunk mmap ring writers.
+//! Optional simd-json hot path behind feature "use_simd_json".
 
 use crate::metrics::MetricsAggregator;
 use crate::storage::mmap_ring::{MmapRing, MmapRingConfig, DEFAULT_META_SIZE};
@@ -12,10 +11,13 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::Value as SerdeValue;
+#[cfg(feature = "use_simd_json")]
+use simd_json::owned::value::Value as SimdValue;
+#[cfg(feature = "use_simd_json")]
+use simd_json::ValueAccess;
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,6 +25,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc::UnboundedReceiver, mpsc::UnboundedSender, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+#[cfg(feature = "use_simd_json")]
+use simd_json::owned::value::Value as SimdValue;
 
 #[derive(Clone, Debug)]
 pub struct BinanceSources {
@@ -34,7 +39,7 @@ pub struct BinanceSources {
     pub chunk_data_capacity: usize,
     pub chunk_index_slots: usize,
     pub chunk_sync_writes: bool,
-    pub chunk_dedupe_size: usize, // new: per-chunk dedupe size
+    pub chunk_dedupe_size: usize,
 }
 
 pub fn crate_level_binance_struct_from_parts(
@@ -52,11 +57,12 @@ pub fn crate_level_binance_struct_from_parts(
         chunk_data_capacity: 512 * 1024 * 1024, // 512 MiB
         chunk_index_slots: 32_768,
         chunk_sync_writes: false,
-        chunk_dedupe_size: 200_000, // default dedupe window
+        chunk_dedupe_size: 200_000,
     }
 }
 
-pub(crate) fn now_ms() -> i64 {
+/// Make now_ms public so writer + main can call it.
+pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -105,7 +111,6 @@ fn backoff_ms_with_jitter(base_ms: u64, attempt: u32, cap_ms: u64) -> u64 {
     rng.gen_range(0..=exp)
 }
 
-/// preallocate file (create parent directories if needed)
 fn preallocate_file(path: &PathBuf, size: u64) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -117,15 +122,13 @@ fn preallocate_file(path: &PathBuf, size: u64) -> Result<(), anyhow::Error> {
         .open(path)?;
     #[cfg(unix)]
     {
-        // attempt posix_fallocate to avoid sparse file if available
         unsafe {
-            // Use posix_fallocate; ignore errno usage, just check return code
             let fd = f.as_raw_fd();
             let r = libc::posix_fallocate(fd, 0, size as libc::off_t);
             if r == 0 {
                 return Ok(());
             } else {
-                tracing::warn!("posix_fallocate returned {} - falling back to set_len", r);
+                tracing::warn!("posix_fallocate failed ({}), falling back to set_len", r);
             }
         }
     }
@@ -133,7 +136,8 @@ fn preallocate_file(path: &PathBuf, size: u64) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Spawn binance connectors by chunking symbol lists and creating per-chunk ring writers.
+/// Spawns per-chunk writers and websocket readers.
+/// Each chunk creates its own MmapRing for data+meta and a local writer task that dedupes by (bid,ask) for snapshots.
 pub async fn spawn_binance_from_config(
     bin_cfg: &BinanceSources,
     tx_snap: UnboundedSender<OrderBookSnapshot>,
@@ -143,7 +147,7 @@ pub async fn spawn_binance_from_config(
 ) -> Result<()> {
     let client = Client::new();
 
-    // resolve books/trades lists (support "ALL")
+    // resolve symbols if "ALL"
     let books: Vec<String> = if bin_cfg.books.len() == 1 && bin_cfg.books[0].to_uppercase() == "ALL"
     {
         info!(exchange=%bin_cfg.name, "querying Binance exchangeInfo for all symbols");
@@ -172,7 +176,6 @@ pub async fn spawn_binance_from_config(
         bin_cfg.trades.clone()
     };
 
-    // chunking
     let chunk_size = if bin_cfg.chunk_size == 0 {
         400
     } else {
@@ -181,7 +184,6 @@ pub async fn spawn_binance_from_config(
     let book_chunks = chunks(&books, chunk_size);
     let trade_chunks = chunks(&trades, chunk_size);
 
-    // local clones
     let exchange_name = bin_cfg.name.clone();
     let ws_url = bin_cfg.ws_url.clone();
 
@@ -190,26 +192,20 @@ pub async fn spawn_binance_from_config(
         if chunk_symbols.is_empty() {
             continue;
         }
-
-        // per-iteration exchange clone (fix borrow/move issues)
         let ex = exchange_name.clone();
         let ring_prefix = format!("rings/{}_book_chunk{}", ex.to_lowercase(), i);
         let data_path = PathBuf::from(format!("{}.data", ring_prefix));
         if let Err(e) = preallocate_file(&data_path, bin_cfg.chunk_data_capacity as u64) {
             warn!(exchange=%ex, chunk=i, "preallocate data failed: {:?}", e);
         }
-
-        // compute meta_size required for index_slots
         let meta_size = std::cmp::max(
             DEFAULT_META_SIZE,
             MmapRing::compute_meta_size(bin_cfg.chunk_index_slots)?,
         );
-
         let meta_path = PathBuf::from(format!("{}.meta", ring_prefix));
         if let Err(e) = preallocate_file(&meta_path, meta_size as u64) {
             warn!(exchange=%ex, chunk=i, "preallocate meta failed: {:?}", e);
         }
-
         let ring_cfg = MmapRingConfig {
             path_prefix: ring_prefix.clone(),
             data_capacity: bin_cfg.chunk_data_capacity,
@@ -218,19 +214,19 @@ pub async fn spawn_binance_from_config(
             create: true,
             force_reinit: true,
             sync_writes: bin_cfg.chunk_sync_writes,
-            flusher_interval_ms: 50, // default; tune down for HFT testing
+            flusher_interval_ms: 50,
         };
         let ring = Arc::new(MmapRing::open(&ring_cfg)?);
 
-        // per-chunk channel
         let (chunk_tx, mut chunk_rx): (
             UnboundedSender<OrderBookSnapshot>,
             UnboundedReceiver<OrderBookSnapshot>,
         ) = tokio::sync::mpsc::unbounded_channel();
 
-        // writer task: dedupe simple cache by (bid, ask) per asset
+        // per-chunk local writer task (dedupe by (bid,ask))
         let ring_w = ring.clone();
         let metrics_w = metrics.clone();
+        let ex_for_task = ex.clone();
         tokio::spawn(async move {
             let mut last_vals: HashMap<String, (f64, f64)> = HashMap::new();
             while let Some(mut snap) = chunk_rx.recv().await {
@@ -241,48 +237,43 @@ pub async fn spawn_binance_from_config(
                 };
                 if should_write {
                     if let Ok(payload) = serde_json::to_vec(&snap) {
-                        if let Ok(_seq) = ring_w.write_record(0u8, &payload) {
-                            // populate writer timestamp for local batch write
-                            snap.writer_ts_ms = Some(now_ms());
-                            last_vals.insert(key, (snap.bid, snap.ask));
-                            // metrics - compute hop timings
-                            let recv_ts = snap.recv_ts_ms as u64;
-                            if let Some(ex_ts) = snap.exchange_ts_ms.map(|v| v as u64) {
-                                let write_ts = snap.writer_ts_ms.unwrap() as u64;
-                                let hop_ex_recv = recv_ts.saturating_sub(ex_ts);
-                                let hop_recv_write = (write_ts as u64).saturating_sub(recv_ts);
-                                let total = (write_ts as u64).saturating_sub(ex_ts);
-                                metrics_w.record_snapshot_latency(
-                                    hop_ex_recv,
-                                    hop_recv_write,
-                                    total,
-                                    payload.len() as u64,
-                                );
-                            } else {
-                                let write_ts = snap.writer_ts_ms.unwrap() as u64;
-                                let hop_recv_write = (write_ts as u64).saturating_sub(recv_ts);
-                                metrics_w.record_snapshot_latency(
-                                    0,
-                                    hop_recv_write,
-                                    hop_recv_write,
-                                    payload.len() as u64,
+                        // writer timestamp
+                        snap.writer_ts_ms = Some(now_ms());
+                        match ring_w.write_record(0u8, &payload) {
+                            Ok(_seq) => {
+                                snap.persist_ts_ms = Some(now_ms());
+                                last_vals.insert(key, (snap.bid, snap.ask));
+                                // metrics: record snapshot latencies
+                                metrics_w.record_snapshot(
+                                    crate::metrics::MetricsRecord::Snapshot {
+                                        ts_iso: chrono::Utc::now().to_rfc3339(),
+                                        exchange: snap.exchange.clone(),
+                                        asset: snap.asset.clone(),
+                                        recv: snap.recv_ts_ms,
+                                        parse: snap.parse_ts_ms,
+                                        enqueue: snap.enqueue_ts_ms,
+                                        writer: snap.writer_ts_ms,
+                                        persist: snap.persist_ts_ms,
+                                        bytes: payload.len(),
+                                    },
                                 );
                             }
-                        } else {
-                            warn!(exchange=%ex, chunk=i, "chunk ring.write_record failed");
+                            Err(e) => {
+                                warn!(exchange=%ex_for_task, chunk=i, "chunk ring.write_record failed: {:?}", e);
+                            }
                         }
                     }
                 }
             }
         });
 
-        // health counters (per-chunk)
+        // health counters
         let recv_msgs = Arc::new(AtomicU64::new(0));
         let recv_bytes = Arc::new(AtomicU64::new(0));
         let reconnects = Arc::new(AtomicU64::new(0));
         let last_exchange_ts_ms = Arc::new(AtomicI64::new(0));
-        let ex = exchange_name.clone();
-        // spawn websocket reader for this chunk (use per-iteration ex clone)
+
+        // spawn websocket reader task
         let ex_clone = ex.clone();
         let url_clone = ws_url.clone();
         let tx_snap_clone = tx_snap.clone();
@@ -317,29 +308,25 @@ pub async fn spawn_binance_from_config(
         info!(exchange=%ex, chunk=i, "spawned book chunk writer and reader; ring={}", ring_prefix);
     }
 
-    // spawn trade chunks (same pattern as book chunks)
+    // spawn trade chunks (same pattern)
     for (i, chunk_symbols) in trade_chunks.into_iter().enumerate() {
         if chunk_symbols.is_empty() {
             continue;
         }
-
         let ex = exchange_name.clone();
         let ring_prefix = format!("rings/{}_trade_chunk{}", ex.to_lowercase(), i);
         let data_path = PathBuf::from(format!("{}.data", ring_prefix));
         if let Err(e) = preallocate_file(&data_path, bin_cfg.chunk_data_capacity as u64) {
             warn!(exchange=%ex, chunk=i, "preallocate data failed: {:?}", e);
         }
-
         let meta_size = std::cmp::max(
             DEFAULT_META_SIZE,
             MmapRing::compute_meta_size(bin_cfg.chunk_index_slots)?,
         );
-
         let meta_path = PathBuf::from(format!("{}.meta", ring_prefix));
         if let Err(e) = preallocate_file(&meta_path, meta_size as u64) {
             warn!(exchange=%ex, chunk=i, "preallocate meta failed: {:?}", e);
         }
-
         let ring_cfg = MmapRingConfig {
             path_prefix: ring_prefix.clone(),
             data_capacity: bin_cfg.chunk_data_capacity,
@@ -348,7 +335,7 @@ pub async fn spawn_binance_from_config(
             create: true,
             force_reinit: true,
             sync_writes: bin_cfg.chunk_sync_writes,
-            flusher_interval_ms: 50, // batch-flush interval for background flusher
+            flusher_interval_ms: 50,
         };
         let ring = Arc::new(MmapRing::open(&ring_cfg)?);
 
@@ -357,29 +344,45 @@ pub async fn spawn_binance_from_config(
 
         let ring_w = ring.clone();
         let metrics_w = metrics.clone();
+        let ex_for_task = ex.clone();
         tokio::spawn(async move {
-            // for trades we typically always write
+            use std::time::Instant;
             while let Some(mut tp) = chunk_rx.recv().await {
                 if let Ok(payload) = serde_json::to_vec(&tp) {
-                    if let Ok(_seq) = ring_w.write_record(1u8, &payload) {
-                        tp.writer_ts_ms = Some(now_ms());
-                        metrics_w.record_trade_latency(0, 0, 0, payload.len() as u64);
-                    } else {
-                        warn!(exchange=%ex, chunk=i, "trade chunk ring.write_record failed");
+                    tp.writer_ts_ms = Some(now_ms());
+                    match ring_w.write_record(1u8, &payload) {
+                        Ok(_seq) => {
+                            tp.persist_ts_ms = Some(now_ms());
+                            metrics_w.record_trade(crate::metrics::MetricsRecord::Trade {
+                                ts_iso: chrono::Utc::now().to_rfc3339(),
+                                exchange: tp.exchange.clone(),
+                                asset: tp.asset.clone(),
+                                recv: tp.recv_ts_ms,
+                                parse: tp.parse_ts_ms,
+                                enqueue: tp.enqueue_ts_ms,
+                                writer: tp.writer_ts_ms,
+                                persist: tp.persist_ts_ms,
+                                bytes: payload.len(),
+                            });
+                        }
+                        Err(e) => {
+                            warn!(exchange=%ex_for_task, chunk=i, "trade chunk ring.write_record failed: {:?}", e);
+                        }
                     }
                 }
             }
         });
 
+        // counters & spawn websocket reader
         let recv_msgs = Arc::new(AtomicU64::new(0));
         let recv_bytes = Arc::new(AtomicU64::new(0));
         let reconnects = Arc::new(AtomicU64::new(0));
         let last_exchange_ts_ms = Arc::new(AtomicI64::new(0));
-        let ex = exchange_name.clone();
-        let ex_for_task = ex.clone(); // one copy per task
+
+        let ex_for_task2 = ex.clone();
         let url_clone = ws_url.clone();
         let tx_tr_clone = tx_tr.clone();
-        let chunk_tx_clone = chunk_tx.clone();
+        let chunk_tx_clone2 = chunk_tx.clone();
         let status_tx_clone = status_tx.clone();
 
         let recv_msgs_c = recv_msgs.clone();
@@ -389,12 +392,12 @@ pub async fn spawn_binance_from_config(
 
         tokio::spawn(async move {
             if let Err(e) = run_binance_trade_stream_chunk(
-                &ex_for_task,
+                &ex_for_task2,
                 &url_clone,
                 i,
                 chunk_symbols,
                 tx_tr_clone,
-                chunk_tx_clone,
+                chunk_tx_clone2,
                 status_tx_clone,
                 recv_msgs_c,
                 recv_bytes_c,
@@ -403,7 +406,7 @@ pub async fn spawn_binance_from_config(
             )
             .await
             {
-                warn!(exchange=%ex_for_task, chunk=i, "trade chunk task error: {:?}", e);
+                warn!(exchange=%ex_for_task2, chunk=i, "trade chunk task error: {:?}", e);
             }
         });
 
@@ -413,9 +416,11 @@ pub async fn spawn_binance_from_config(
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// chunked websocket readers
-// ---------------------------------------------------------------------
+// -------------------- Reader implementations --------------------
+// These are long but follow the same logic: read ws text, stamp recv_ts,
+// parse (simd-json if feature enabled / serde_json fallback), stamp parse_ts,
+// construct object, stamp enqueue_ts and send to central + chunk writer.
+
 #[allow(clippy::too_many_arguments)]
 async fn run_binance_book_stream_chunk(
     exchange: &str,
@@ -431,10 +436,6 @@ async fn run_binance_book_stream_chunk(
     last_exchange_ts_ms: Arc<AtomicI64>,
 ) -> Result<()> {
     let streams_joined = streams_for_symbols(&symbols, "bookTicker");
-
-    if streams_joined.len() > 60_000 {
-        warn!(exchange=%exchange, chunk=chunk_id, streams_len=%streams_joined.len(), "constructed stream list is very large; consider reducing chunk_size");
-    }
 
     let base = {
         let mut s = ws_url.trim_end_matches('/').to_string();
@@ -474,8 +475,8 @@ async fn run_binance_book_stream_chunk(
                     detail: Some(format!("chunk {}", chunk_id)),
                     ts_ms: now_ms(),
                 });
-
                 attempt = 0;
+
                 let (mut write, mut read) = ws_stream.split();
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
 
@@ -498,49 +499,105 @@ async fn run_binance_book_stream_chunk(
                                     recv_msgs.fetch_add(1, Ordering::Relaxed);
                                     recv_bytes.fetch_add(txt.len() as u64, Ordering::Relaxed);
 
-                                    if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                                        if let Some(data) = v.get("data").cloned().or(Some(v.clone())) {
-                                            if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
-                                                let bid = data.get("b")
-                                                    .and_then(|x| x.as_str())
-                                                    .and_then(|s| s.parse::<f64>().ok())
-                                                    .unwrap_or(f64::NAN);
-                                                let ask = data.get("a")
-                                                    .and_then(|x| x.as_str())
-                                                    .and_then(|s| s.parse::<f64>().ok())
-                                                    .unwrap_or(f64::NAN);
-                                                let ts_opt = data.get("E").and_then(|x| x.as_i64());
-                                                if let Some(tsv) = ts_opt {
-                                                    last_exchange_ts_ms.store(tsv, Ordering::Relaxed);
-                                                }
-                                                let event_u = data.get("u").and_then(|x| x.as_u64());
-                                                if bid.is_finite() && ask.is_finite() && ask >= bid {
-                                                    let mid = 0.5*(bid+ask);
-                                                    let snap = OrderBookSnapshot {
-                                                        exchange: exchange.to_string(),
-                                                        asset: sym.to_uppercase(),
-                                                        kind: AssetKind::Spot,
-                                                        bid,
-                                                        ask,
-                                                        mid,
-                                                        exchange_ts_ms: ts_opt,
-                                                        event_u,
-                                                        recv_ts_ms: recv_ts,
-                                                        writer_ts_ms: None,
-                                                    };
-                                                    // send to central consumers
-                                                    if tx_snap.send(snap.clone()).is_err() {
-                                                        warn!(exchange=%exchange, chunk=chunk_id,"tx_snap closed; stopping book chunk stream");
-                                                        break;
+                                    // parse logic with optional simd-json
+                                    #[cfg(feature = "use_simd_json")]
+                                    {
+                                        match simd_json::to_owned_value(txt.as_bytes()) {
+                                            Ok(v) => {
+                                                let parse_ts = now_ms();
+                                                let data = v.get("data").cloned().unwrap_or(v.clone());
+                                                if let Some(sym_v) = data.get("s") {
+                                                    if let Some(sym) = sym_v.as_str() {
+                                                        let bid = data.get("b").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let ask = data.get("a").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let ts_opt = data.get("E").and_then(|x| x.as_i64());
+                                                        if let Some(tsv) = ts_opt { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
+                                                        let event_u = data.get("u").and_then(|x| x.as_u64());
+                                                        if bid.is_finite() && ask.is_finite() && ask >= bid {
+                                                            let mid = 0.5*(bid+ask);
+                                                            let mut snap = OrderBookSnapshot {
+                                                                exchange: exchange.to_string(),
+                                                                asset: sym.to_uppercase(),
+                                                                kind: AssetKind::Spot,
+                                                                bid,
+                                                                ask,
+                                                                mid,
+                                                                exchange_ts_ms: ts_opt,
+                                                                event_u,
+                                                                recv_ts_ms: recv_ts,
+                                                                parse_ts_ms: Some(parse_ts),
+                                                                enqueue_ts_ms: None,
+                                                                writer_ts_ms: None,
+                                                                persist_ts_ms: None,
+                                                            };
+                                                            snap.enqueue_ts_ms = Some(now_ms());
+                                                            if tx_snap.send(snap.clone()).is_err() {
+                                                                warn!(exchange=%exchange, chunk=chunk_id,"tx_snap closed; stopping book chunk stream");
+                                                                break;
+                                                            }
+                                                            let _ = chunk_writer_tx.send(snap);
+                                                        }
                                                     }
-                                                    // send to chunk local writer, best-effort
-                                                    let _ = chunk_writer_tx.send(snap);
                                                 }
                                             }
+                                            Err(e) => {
+                                                debug!(exchange=%exchange, chunk=chunk_id, "simd-json book parse failed: {:?}", e);
+                                            }
                                         }
-                                    } else {
-                                        debug!(exchange=%exchange, chunk=chunk_id,"book text not JSON: {}", txt);
                                     }
+
+                                    #[cfg(not(feature = "use_simd_json"))]
+                                    {
+                                        if let Ok(v) = serde_json::from_str::<SerdeValue>(&txt) {
+                                            let parse_ts = now_ms();
+                                            if let Some(data) = v.get("data").cloned().or(Some(v.clone())) {
+                                                if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
+                                                    let bid = data.get("b")
+                                                        .and_then(|x| x.as_str())
+                                                        .and_then(|s| s.parse::<f64>().ok())
+                                                        .unwrap_or(f64::NAN);
+                                                    let ask = data.get("a")
+                                                        .and_then(|x| x.as_str())
+                                                        .and_then(|s| s.parse::<f64>().ok())
+                                                        .unwrap_or(f64::NAN);
+                                                    let ts_opt = data.get("E").and_then(|x| x.as_i64());
+                                                    if let Some(tsv) = ts_opt {
+                                                        last_exchange_ts_ms.store(tsv, Ordering::Relaxed);
+                                                    }
+                                                    let event_u = data.get("u").and_then(|x| x.as_u64());
+                                                    if bid.is_finite() && ask.is_finite() && ask >= bid {
+                                                        let mid = 0.5*(bid+ask);
+                                                        let mut snap = OrderBookSnapshot {
+                                                            exchange: exchange.to_string(),
+                                                            asset: sym.to_uppercase(),
+                                                            kind: AssetKind::Spot,
+                                                            bid,
+                                                            ask,
+                                                            mid,
+                                                            exchange_ts_ms: ts_opt,
+                                                            event_u,
+                                                            recv_ts_ms: recv_ts,
+                                                            parse_ts_ms: Some(parse_ts),
+                                                            enqueue_ts_ms: None,
+                                                            writer_ts_ms: None,
+                                                            persist_ts_ms: None,
+                                                        };
+                                                        snap.enqueue_ts_ms = Some(now_ms());
+                                                        if tx_snap.send(snap.clone()).is_err() {
+                                                            warn!(exchange=%exchange, chunk=chunk_id,"tx_snap closed; stopping book chunk stream");
+                                                            break;
+                                                        }
+                                                        let _ = chunk_writer_tx.send(snap);
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            debug!(exchange=%exchange, chunk=chunk_id,"book text not JSON: {}", txt);
+                                        }
+                                    }
+                                }
+                                Ok(Message::Binary(bin)) => {
+                                    debug!(exchange=%exchange, chunk=chunk_id, "binary message received len={}", bin.len());
                                 }
                                 Ok(Message::Close(_)) => {
                                     warn!(exchange=%exchange, chunk=chunk_id,"book close received, reconnecting");
@@ -556,7 +613,7 @@ async fn run_binance_book_stream_chunk(
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             }
             Err(e) => {
@@ -592,10 +649,6 @@ async fn run_binance_trade_stream_chunk(
     last_exchange_ts_ms: Arc<AtomicI64>,
 ) -> Result<()> {
     let streams_joined = streams_for_symbols(&symbols, "trade");
-
-    if streams_joined.len() > 60_000 {
-        warn!(exchange=%exchange, chunk=chunk_id, streams_len=%streams_joined.len(), "constructed stream list is very large; consider reducing chunk_size");
-    }
 
     let base = {
         let mut s = ws_url.trim_end_matches('/').to_string();
@@ -659,71 +712,160 @@ async fn run_binance_trade_stream_chunk(
                                     recv_msgs.fetch_add(1, Ordering::Relaxed);
                                     recv_bytes.fetch_add(txt.len() as u64, Ordering::Relaxed);
 
-                                    if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                                        if let Some(data) = v.get("data").cloned().or(Some(v.clone())) {
-                                            if let Some(arr) = data.as_array() {
-                                                for tr in arr {
-                                                    let px = tr.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
-                                                    let sz = tr.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                                    let ts = tr.get("E").and_then(|x| x.as_i64());
-                                                    if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
-                                                    let event_u = tr.get("u").and_then(|x| x.as_u64());
-                                                    let sym = tr.get("s").and_then(|x| x.as_str()).unwrap_or("").to_uppercase();
-                                                    let side = tr.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
-                                                    if px.is_finite() && sz > 0.0 {
-                                                        let tp = TradePrint {
-                                                            exchange: exchange.to_string(),
-                                                            asset: sym.clone(),
-                                                            kind: AssetKind::Spot,
-                                                            px,
-                                                            sz,
-                                                            side,
-                                                            exchange_ts_ms: ts,
-                                                            event_u,
-                                                            recv_ts_ms: recv_ts,
-                                                            writer_ts_ms: None,
-                                                        };
-                                                        // send to central consumer
-                                                        if tx_tr.send(tp.clone()).is_err() {
-                                                            warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
-                                                            break;
+                                    #[cfg(feature = "use_simd_json")]
+                                    {
+                                        match simd_json::to_owned_value(txt.as_bytes()) {
+                                            Ok(v) => {
+                                                let parse_ts = now_ms();
+                                                let data = v.get("data").cloned().unwrap_or(v.clone());
+                                                if let Some(arr) = data.as_array() {
+                                                    for tr in arr {
+                                                        let px = tr.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let sz = tr.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                                        let ts = tr.get("E").and_then(|x| x.as_i64());
+                                                        if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
+                                                        let event_u = tr.get("u").and_then(|x| x.as_u64());
+                                                        let sym = tr.get("s").and_then(|x| x.as_str()).unwrap_or("").to_uppercase();
+                                                        let side = tr.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
+                                                        if px.is_finite() && sz > 0.0 {
+                                                            let mut tp = TradePrint {
+                                                                exchange: exchange.to_string(),
+                                                                asset: sym.clone(),
+                                                                kind: AssetKind::Spot,
+                                                                px,
+                                                                sz,
+                                                                side,
+                                                                exchange_ts_ms: ts,
+                                                                event_u,
+                                                                recv_ts_ms: recv_ts,
+                                                                parse_ts_ms: Some(parse_ts),
+                                                                enqueue_ts_ms: None,
+                                                                writer_ts_ms: None,
+                                                                persist_ts_ms: None,
+                                                            };
+                                                            tp.enqueue_ts_ms = Some(now_ms());
+                                                            if tx_tr.send(tp.clone()).is_err() {
+                                                                warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
+                                                                break;
+                                                            }
+                                                            let _ = chunk_writer_tx.send(tp);
                                                         }
-                                                        // local chunk writer
-                                                        let _ = chunk_writer_tx.send(tp);
                                                     }
-                                                }
-                                            } else {
-                                                if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
-                                                    let px = data.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
-                                                    let sz = data.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                                    let ts = data.get("E").and_then(|x| x.as_i64());
-                                                    if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
-                                                    let event_u = data.get("u").and_then(|x| x.as_u64());
-                                                    let side = data.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
-                                                    if px.is_finite() && sz > 0.0 {
-                                                        let tp = TradePrint {
-                                                            exchange: exchange.to_string(),
-                                                            asset: sym.to_uppercase(),
-                                                            kind: AssetKind::Spot,
-                                                            px,
-                                                            sz,
-                                                            side,
-                                                            exchange_ts_ms: ts,
-                                                            event_u,
-                                                            recv_ts_ms: recv_ts,
-                                                            writer_ts_ms: None,
-                                                        };
-                                                        if tx_tr.send(tp.clone()).is_err() {
-                                                            warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
-                                                            break;
+                                                } else {
+                                                    if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
+                                                        let px = data.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let sz = data.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                                        let ts = data.get("E").and_then(|x| x.as_i64());
+                                                        if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
+                                                        let event_u = data.get("u").and_then(|x| x.as_u64());
+                                                        let side = data.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
+                                                        if px.is_finite() && sz > 0.0 {
+                                                            let mut tp = TradePrint {
+                                                                exchange: exchange.to_string(),
+                                                                asset: sym.to_uppercase(),
+                                                                kind: AssetKind::Spot,
+                                                                px,
+                                                                sz,
+                                                                side,
+                                                                exchange_ts_ms: ts,
+                                                                event_u,
+                                                                recv_ts_ms: recv_ts,
+                                                                parse_ts_ms: Some(parse_ts),
+                                                                enqueue_ts_ms: None,
+                                                                writer_ts_ms: None,
+                                                                persist_ts_ms: None,
+                                                            };
+                                                            tp.enqueue_ts_ms = Some(now_ms());
+                                                            if tx_tr.send(tp.clone()).is_err() {
+                                                                warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
+                                                                break;
+                                                            }
+                                                            let _ = chunk_writer_tx.send(tp);
                                                         }
-                                                        let _ = chunk_writer_tx.send(tp);
                                                     }
                                                 }
                                             }
+                                            Err(e) => {
+                                                debug!(exchange=%exchange, chunk=chunk_id,"simd-json trade parse failed: {:?}", e);
+                                            }
                                         }
-                                    } else {
-                                        debug!(exchange=%exchange, chunk=chunk_id,"trade text not JSON: {}", txt);
+                                    }
+
+                                    #[cfg(not(feature = "use_simd_json"))]
+                                    {
+                                        if let Ok(v) = serde_json::from_str::<SerdeValue>(&txt) {
+                                            let parse_ts = now_ms();
+                                            if let Some(data) = v.get("data").cloned().or(Some(v.clone())) {
+                                                if let Some(arr) = data.as_array() {
+                                                    for tr in arr {
+                                                        let px = tr.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let sz = tr.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                                        let ts = tr.get("E").and_then(|x| x.as_i64());
+                                                        if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
+                                                        let event_u = tr.get("u").and_then(|x| x.as_u64());
+                                                        let sym = tr.get("s").and_then(|x| x.as_str()).unwrap_or("").to_uppercase();
+                                                        let side = tr.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
+                                                        if px.is_finite() && sz > 0.0 {
+                                                            let mut tp = TradePrint {
+                                                                exchange: exchange.to_string(),
+                                                                asset: sym.clone(),
+                                                                kind: AssetKind::Spot,
+                                                                px,
+                                                                sz,
+                                                                side,
+                                                                exchange_ts_ms: ts,
+                                                                event_u,
+                                                                recv_ts_ms: recv_ts,
+                                                                parse_ts_ms: Some(parse_ts),
+                                                                enqueue_ts_ms: None,
+                                                                writer_ts_ms: None,
+                                                                persist_ts_ms: None,
+                                                            };
+                                                            tp.enqueue_ts_ms = Some(now_ms());
+                                                            if tx_tr.send(tp.clone()).is_err() {
+                                                                warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
+                                                                break;
+                                                            }
+                                                            let _ = chunk_writer_tx.send(tp);
+                                                        }
+                                                    }
+                                                } else {
+                                                    if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
+                                                        let px = data.get("p").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                                                        let sz = data.get("q").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                                        let ts = data.get("E").and_then(|x| x.as_i64());
+                                                        if let Some(tsv) = ts { last_exchange_ts_ms.store(tsv, Ordering::Relaxed); }
+                                                        let event_u = data.get("u").and_then(|x| x.as_u64());
+                                                        let side = data.get("m").and_then(|x| x.as_bool()).map(|is_maker| if is_maker { TradeSide::Sell } else { TradeSide::Buy }).unwrap_or(TradeSide::Unknown);
+                                                        if px.is_finite() && sz > 0.0 {
+                                                            let mut tp = TradePrint {
+                                                                exchange: exchange.to_string(),
+                                                                asset: sym.to_uppercase(),
+                                                                kind: AssetKind::Spot,
+                                                                px,
+                                                                sz,
+                                                                side,
+                                                                exchange_ts_ms: ts,
+                                                                event_u,
+                                                                recv_ts_ms: recv_ts,
+                                                                parse_ts_ms: Some(parse_ts),
+                                                                enqueue_ts_ms: None,
+                                                                writer_ts_ms: None,
+                                                                persist_ts_ms: None,
+                                                            };
+                                                            tp.enqueue_ts_ms = Some(now_ms());
+                                                            if tx_tr.send(tp.clone()).is_err() {
+                                                                warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
+                                                                break;
+                                                            }
+                                                            let _ = chunk_writer_tx.send(tp);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            debug!(exchange=%exchange, chunk=chunk_id,"trade text not JSON: {}", txt);
+                                        }
                                     }
                                 }
                                 Ok(Message::Close(_)) => {
@@ -740,7 +882,7 @@ async fn run_binance_trade_stream_chunk(
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             }
             Err(e) => {

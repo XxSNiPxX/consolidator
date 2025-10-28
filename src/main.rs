@@ -58,16 +58,19 @@ async fn main() -> Result<()> {
     // If you need global rings here, compute meta_size with compute_meta_size(index_slots).
 
     // Spawn snapshot writer task (central)
+    // Spawn snapshot writer task (central)
+    // Spawn snapshot writer task (central) — no global ring
     let metrics_cl = metrics.clone();
     tokio::spawn(async move {
-        snapshot_writer_task(rx_snap, metrics_cl).await;
+        snapshot_writer_task(rx_snap, None, metrics_cl).await;
         tracing::info!("central snapshot_writer_task exited");
     });
 
-    // Spawn trade writer task (central)
+    // Spawn trade writer task (central) — no global ring, provide dedupe size
     let metrics_cl2 = metrics.clone();
+    let dedupe_size = bin_cfg.chunk_dedupe_size;
     tokio::spawn(async move {
-        trade_writer_task(rx_tr, metrics_cl2).await;
+        trade_writer_task(rx_tr, None, metrics_cl2, dedupe_size).await;
         tracing::info!("central trade_writer_task exited");
     });
 

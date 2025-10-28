@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AssetKind {
     Spot,
-    Derivative,
+    // extend if needed
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,9 +22,11 @@ pub struct OrderBookSnapshot {
     pub bid: f64,
     pub ask: f64,
     pub mid: f64,
-    pub exchange_ts_ms: Option<i64>, // parsed from "E"
-    pub event_u: Option<u64>,        // parsed from "u" if present
-    pub recv_ts_ms: i64,             // local recv time
+    // timestamps / event ids
+    pub exchange_ts_ms: Option<i64>, // from exchange message
+    pub event_u: Option<u64>,
+    pub recv_ts_ms: i64,           // when we received / parsed
+    pub writer_ts_ms: Option<i64>, // when writer persisted (populated by writer)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +40,7 @@ pub struct TradePrint {
     pub exchange_ts_ms: Option<i64>,
     pub event_u: Option<u64>,
     pub recv_ts_ms: i64,
+    pub writer_ts_ms: Option<i64>, // when writer persisted
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1,40 +1,26 @@
+// src/storage/mmap_ring.rs
 //! Mmap-backed byte-tail circular buffer with index slots in .meta
-//!
-//! Meta layout:
-//! 0..8   : magic bytes (RINGV1\0\0)
-//! 8..16  : data_capacity (u64 LE)
-//! 16..24 : tail_offset (u64 LE)
-//! 24..32 : seq_counter (u64 LE)
-//! 32..40 : index_slots (u64 LE)
-//! 40..   : index_slots * INDEX_SLOT_SIZE  (index slot array)
-//!
-//! Index slot layout (INDEX_SLOT_SIZE = 24):
-//! 0..8   : off (u64 LE)
-//! 8..12  : len (u32 LE)
-//! 12..20 : seq (u64 LE)
-//! 20     : kind (u8)
-//! 21..24 : padding
-//!
-//! Data layout:
-//! For each record:
-//! [0..4)   payload_len: u32 LE
-//! [4]      kind: u8
-//! [5..12)  padding (7 bytes)
-//! [12..20) seq: u64 LE
-//! [20..]   payload payload_len bytes (utf-8 JSON)
+//! HFT-hardened: CRC, publish-seq, background flusher, mlock+touch.
 
 use anyhow::{bail, Context, Result};
+use crc32fast::Hasher;
 use memmap2::{MmapMut, MmapOptions};
 use parking_lot::Mutex;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+#[cfg(unix)]
+use libc;
 
 pub const DEFAULT_META_SIZE: usize = 64 * 1024; // 64 KiB minimum
 pub const META_MAGIC: &[u8; 8] = b"RINGV1\x00\x00";
 pub const META_HEADER_LEN: usize = 40; // 8 + 8 + 8 + 8 + 8
 pub const INDEX_SLOT_SIZE: usize = 24;
-pub const RECORD_HEADER_LEN: usize = 20;
+pub const RECORD_HEADER_LEN: usize = 20; // [u32 len][u8 kind][7 padding][u64 seq]
+pub const CRC_LEN: usize = 4;
 pub const MAX_INDEX_SLOTS: usize = 10_000_000; // safety bound
 
 #[derive(Clone, Debug)]
@@ -45,7 +31,8 @@ pub struct MmapRingConfig {
     pub meta_size: usize,
     pub create: bool,
     pub force_reinit: bool,
-    pub sync_writes: bool,
+    pub sync_writes: bool,        // durable mode (per-write flush) if true
+    pub flusher_interval_ms: u64, // background flusher interval when sync_writes == false
 }
 
 pub struct MmapRing {
@@ -61,7 +48,6 @@ pub struct MmapRing {
 }
 
 impl MmapRing {
-    /// Compute the minimal meta size required for given index_slots. Rounds up to 4 KiB.
     pub fn compute_meta_size(index_slots: usize) -> Result<usize> {
         if index_slots == 0 {
             bail!("index_slots must be > 0");
@@ -156,6 +142,7 @@ impl MmapRing {
             for i in META_HEADER_LEN..(META_HEADER_LEN + index_area_len) {
                 meta_m[i] = 0;
             }
+            // flush header immediately (creation time)
             meta_m.flush()?;
         } else {
             // header existed: validate data_capacity and index_slots
@@ -177,7 +164,7 @@ impl MmapRing {
             }
         }
 
-        Ok(MmapRing {
+        let ring = MmapRing {
             meta_path,
             data_path,
             data_capacity: cfg.data_capacity,
@@ -186,7 +173,17 @@ impl MmapRing {
             write_lock: Mutex::new(()),
             index_slots: cfg.index_slots,
             sync_writes: cfg.sync_writes,
-        })
+        };
+
+        // try to mlock and touch pages to avoid page-fault jitter
+        ring.mlock_and_touch_if_possible()?;
+
+        // background flusher for non-durable mode
+        if !cfg.sync_writes {
+            ring.spawn_background_flusher(cfg.flusher_interval_ms);
+        }
+
+        Ok(ring)
     }
 
     fn read_meta_tail_locked(meta: &MmapMut) -> usize {
@@ -212,19 +209,19 @@ impl MmapRing {
         meta[slot_base + 8..slot_base + 12].copy_from_slice(&ln.to_le_bytes());
         meta[slot_base + 12..slot_base + 20].copy_from_slice(&seq.to_le_bytes());
         meta[slot_base + 20] = kind;
-        // padding remains
+        // padding left as-is
     }
 
-    /// Write a record and update index slot. Returns sequence number.
+    /// Write record. Layout:
+    /// [u32 payload_len][u8 kind][7 padding][u64 seq][payload bytes][crc32 u32]
     pub fn write_record(&self, kind: u8, payload: &[u8]) -> Result<u64> {
         let _wl = self.write_lock.lock();
 
-        let record_header_len = 4 + 1 + 7 + 8; // 20
-        if payload.len() + record_header_len > self.data_capacity {
+        let total_len = RECORD_HEADER_LEN + payload.len() + CRC_LEN;
+        if total_len > self.data_capacity {
             bail!("single record too large for data_capacity");
         }
 
-        // locks
         let mut meta_guard = self.meta_mmap.lock();
         let mut data_guard = self.data_mmap.lock();
 
@@ -232,59 +229,92 @@ impl MmapRing {
         let cur_seq = Self::read_meta_seq_locked(&meta_guard);
         let seq = cur_seq.saturating_add(1);
 
-        // prepare header: [payload_len:u32][kind:u8][pad:7][seq:u64]
+        // header
         let mut header = [0u8; RECORD_HEADER_LEN];
         header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         header[4] = kind;
         header[12..20].copy_from_slice(&seq.to_le_bytes());
 
-        let total_len = record_header_len + payload.len();
+        // crc
+        let mut hasher = Hasher::new();
+        hasher.update(&header);
+        hasher.update(payload);
+        let crc = hasher.finalize();
+        let crc_bytes = crc.to_le_bytes();
+
         let data_cap = self.data_capacity;
         let write_off = tail % data_cap;
 
-        // write record with wrap awareness
+        // write with wrap handling (kept explicit to be safe)
         if write_off + total_len <= data_cap {
-            data_guard[write_off..write_off + record_header_len].copy_from_slice(&header);
-            data_guard[write_off + record_header_len..write_off + total_len]
+            data_guard[write_off..write_off + RECORD_HEADER_LEN].copy_from_slice(&header);
+            data_guard
+                [write_off + RECORD_HEADER_LEN..write_off + RECORD_HEADER_LEN + payload.len()]
                 .copy_from_slice(payload);
+            data_guard[write_off + RECORD_HEADER_LEN + payload.len()..write_off + total_len]
+                .copy_from_slice(&crc_bytes);
         } else {
             let first_part = data_cap - write_off;
-            if first_part >= record_header_len {
-                let header_part = record_header_len;
+            if first_part >= RECORD_HEADER_LEN {
+                let header_part = RECORD_HEADER_LEN;
                 data_guard[write_off..write_off + header_part].copy_from_slice(&header);
                 let remaining_first = first_part - header_part;
                 let to_copy_first = std::cmp::min(remaining_first, payload.len());
                 if to_copy_first > 0 {
-                    let dst_start = write_off + header_part;
-                    data_guard[dst_start..dst_start + to_copy_first]
-                        .copy_from_slice(&payload[..to_copy_first]);
+                    let dst = write_off + header_part;
+                    data_guard[dst..dst + to_copy_first].copy_from_slice(&payload[..to_copy_first]);
                 }
                 let remaining = payload.len() - std::cmp::min(remaining_first, payload.len());
                 if remaining > 0 {
                     data_guard[..remaining].copy_from_slice(&payload[payload.len() - remaining..]);
+                    // crc after that
+                    data_guard[remaining..remaining + CRC_LEN].copy_from_slice(&crc_bytes);
+                } else {
+                    // crc may wrap
+                    let crc_pos = (write_off + header_part + to_copy_first) % data_cap;
+                    if crc_pos + CRC_LEN <= data_cap {
+                        data_guard[crc_pos..crc_pos + CRC_LEN].copy_from_slice(&crc_bytes);
+                    } else {
+                        let c_first = data_cap - crc_pos;
+                        data_guard[crc_pos..data_cap].copy_from_slice(&crc_bytes[..c_first]);
+                        data_guard[..CRC_LEN - c_first]
+                            .copy_from_slice(&crc_bytes[c_first..CRC_LEN]);
+                    }
                 }
             } else {
-                // header itself crosses boundary
+                // header crosses boundary
                 let h_first = first_part;
                 data_guard[write_off..data_cap].copy_from_slice(&header[..h_first]);
-                let h_second = record_header_len - h_first;
-                data_guard[..h_second].copy_from_slice(&header[h_first..record_header_len]);
-                // then payload
+                let h_second = RECORD_HEADER_LEN - h_first;
+                data_guard[..h_second].copy_from_slice(&header[h_first..RECORD_HEADER_LEN]);
                 let payload_start = h_second;
                 if payload_start + payload.len() <= data_cap {
                     data_guard[payload_start..payload_start + payload.len()]
                         .copy_from_slice(payload);
+                    let crc_pos = payload_start + payload.len();
+                    if crc_pos + CRC_LEN <= data_cap {
+                        data_guard[crc_pos..crc_pos + CRC_LEN].copy_from_slice(&crc_bytes);
+                    } else {
+                        let c_first = data_cap - crc_pos;
+                        data_guard[crc_pos..data_cap].copy_from_slice(&crc_bytes[..c_first]);
+                        data_guard[..CRC_LEN - c_first]
+                            .copy_from_slice(&crc_bytes[c_first..CRC_LEN]);
+                    }
                 } else {
                     let part2 = data_cap - payload_start;
                     data_guard[payload_start..data_cap].copy_from_slice(&payload[..part2]);
                     data_guard[..payload.len() - part2].copy_from_slice(&payload[part2..]);
+                    let crc_pos = (payload.len() - part2) % data_cap;
+                    if crc_pos + CRC_LEN <= data_cap {
+                        data_guard[crc_pos..crc_pos + CRC_LEN].copy_from_slice(&crc_bytes);
+                    } else {
+                        let c_first = data_cap - crc_pos;
+                        data_guard[crc_pos..data_cap].copy_from_slice(&crc_bytes[..c_first]);
+                        data_guard[..CRC_LEN - c_first]
+                            .copy_from_slice(&crc_bytes[c_first..CRC_LEN]);
+                    }
                 }
             }
-        }
-
-        // flush data iff requested (sync_writes). Otherwise only meta is flushed.
-        if self.sync_writes {
-            data_guard.flush()?;
         }
 
         // update index slot
@@ -293,13 +323,16 @@ impl MmapRing {
         let ln_u32 = total_len as u32;
         Self::write_index_slot_locked(&mut meta_guard, idx, off_u64, ln_u32, seq, kind);
 
-        // update meta tail and seq
+        // update tail & seq (publish cursor)
         let new_tail = (tail + total_len) % data_cap;
         meta_guard[16..24].copy_from_slice(&(new_tail as u64).to_le_bytes());
         meta_guard[24..32].copy_from_slice(&seq.to_le_bytes());
 
-        // persist meta (so readers see tail/seq change)
-        meta_guard.flush()?;
+        // durable mode flush if requested; otherwise background flusher handles it
+        if self.sync_writes {
+            meta_guard.flush()?;
+            data_guard.flush()?;
+        }
 
         Ok(seq)
     }
@@ -310,5 +343,123 @@ impl MmapRing {
         let tail = Self::read_meta_tail_locked(&meta_guard);
         let seq = Self::read_meta_seq_locked(&meta_guard);
         (tail, seq)
+    }
+
+    fn spawn_background_flusher(&self, interval_ms: u64) {
+        let meta = Arc::clone(&self.meta_mmap);
+        let data = Arc::clone(&self.data_mmap);
+        let intv = if interval_ms == 0 { 50 } else { interval_ms };
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(intv));
+            let _ = meta.lock().flush();
+            let _ = data.lock().flush();
+        });
+    }
+
+    fn mlock_and_touch_if_possible(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let meta_len = {
+                let m = self.meta_mmap.lock();
+                m.len()
+            };
+            let data_len = {
+                let d = self.data_mmap.lock();
+                d.len()
+            };
+            unsafe {
+                let meta_ptr = self.meta_mmap.lock().as_ptr();
+                if libc::mlock(meta_ptr as *const _, meta_len) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!("mlock(meta) failed: {:?}", err);
+                }
+                let data_ptr = self.data_mmap.lock().as_ptr();
+                if libc::mlock(data_ptr as *const _, data_len) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!("mlock(data) failed: {:?}", err);
+                }
+                let page = 4096usize;
+                for i in (0..meta_len).step_by(page) {
+                    std::ptr::read_volatile(meta_ptr.add(i));
+                }
+                for i in (0..data_len).step_by(page) {
+                    std::ptr::read_volatile(data_ptr.add(i));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        { /* no-op */ }
+        Ok(())
+    }
+
+    /// Convenience reader that reads record by seq and validates CRC and seq in header.
+    pub fn read_record_by_seq(&self, seq: u64) -> Result<(u8, Vec<u8>)> {
+        let meta_guard = self.meta_mmap.lock();
+        let idx = (seq as usize) % self.index_slots;
+        let slot_base = META_HEADER_LEN + idx * INDEX_SLOT_SIZE;
+        let off =
+            u64::from_le_bytes(meta_guard[slot_base..slot_base + 8].try_into().unwrap()) as usize;
+        let ln = u32::from_le_bytes(
+            meta_guard[slot_base + 8..slot_base + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let slot_seq = u64::from_le_bytes(
+            meta_guard[slot_base + 12..slot_base + 20]
+                .try_into()
+                .unwrap(),
+        );
+        let kind = meta_guard[slot_base + 20];
+        drop(meta_guard);
+
+        if slot_seq != seq {
+            bail!(
+                "index slot seq mismatch (expected {}, slot {})",
+                seq,
+                slot_seq
+            );
+        }
+        if ln < RECORD_HEADER_LEN + CRC_LEN {
+            bail!("index slot length too small");
+        }
+
+        let data_guard = self.data_mmap.lock();
+        let data_cap = self.data_capacity;
+        let mut raw = vec![0u8; ln];
+        let end = off + ln;
+        if end <= data_cap {
+            raw.copy_from_slice(&data_guard[off..end]);
+        } else {
+            let part1 = data_cap - off;
+            raw[..part1].copy_from_slice(&data_guard[off..data_cap]);
+            raw[part1..].copy_from_slice(&data_guard[..(ln - part1)]);
+        }
+        let payload_len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let kind_b = raw[4];
+        let seq_in_header = u64::from_le_bytes(raw[12..20].try_into().unwrap());
+        if seq_in_header != seq {
+            bail!(
+                "seq mismatch in header (expected {}, found {})",
+                seq,
+                seq_in_header
+            );
+        }
+        if payload_len + RECORD_HEADER_LEN + CRC_LEN != ln {
+            bail!("payload length mismatch");
+        }
+        let payload = raw[RECORD_HEADER_LEN..RECORD_HEADER_LEN + payload_len].to_vec();
+        let crc_stored = u32::from_le_bytes(
+            raw[RECORD_HEADER_LEN + payload_len..RECORD_HEADER_LEN + payload_len + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let mut hasher = Hasher::new();
+        hasher.update(&raw[0..RECORD_HEADER_LEN]);
+        hasher.update(&payload);
+        let crc_calc = hasher.finalize();
+        if crc_calc != crc_stored {
+            bail!("crc mismatch for seq {}", seq);
+        }
+        Ok((kind_b, payload))
     }
 }

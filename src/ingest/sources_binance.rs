@@ -1,3 +1,4 @@
+// src/ingest/sources_binance.rs
 //! Binance ingestion: per-chunk websocket readers + per-chunk mmap ring writers.
 //! - computes meta_size with MmapRing::compute_meta_size for index_slots
 //! - preallocates data and meta files (posix_fallocate on unix when available)
@@ -13,6 +14,8 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,9 +24,6 @@ use tokio::sync::{mpsc::UnboundedReceiver, mpsc::UnboundedSender, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-
 #[derive(Clone, Debug)]
 pub struct BinanceSources {
     pub name: String,
@@ -31,9 +31,10 @@ pub struct BinanceSources {
     pub books: Vec<String>,
     pub trades: Vec<String>,
     pub chunk_size: usize,
-    pub chunk_data_capacity: usize, // bytes per chunk ring
+    pub chunk_data_capacity: usize,
     pub chunk_index_slots: usize,
     pub chunk_sync_writes: bool,
+    pub chunk_dedupe_size: usize, // new: per-chunk dedupe size
 }
 
 pub fn crate_level_binance_struct_from_parts(
@@ -51,10 +52,11 @@ pub fn crate_level_binance_struct_from_parts(
         chunk_data_capacity: 512 * 1024 * 1024, // 512 MiB
         chunk_index_slots: 32_768,
         chunk_sync_writes: false,
+        chunk_dedupe_size: 200_000, // default dedupe window
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -115,14 +117,15 @@ fn preallocate_file(path: &PathBuf, size: u64) -> Result<(), anyhow::Error> {
         .open(path)?;
     #[cfg(unix)]
     {
-        // posix_fallocate to avoid sparse file if available
+        // attempt posix_fallocate to avoid sparse file if available
         unsafe {
+            // Use posix_fallocate; ignore errno usage, just check return code
             let fd = f.as_raw_fd();
             let r = libc::posix_fallocate(fd, 0, size as libc::off_t);
             if r == 0 {
                 return Ok(());
             } else {
-                tracing::warn!("posix_fallocate failed ({}), falling back to set_len", r);
+                tracing::warn!("posix_fallocate returned {} - falling back to set_len", r);
             }
         }
     }
@@ -215,6 +218,7 @@ pub async fn spawn_binance_from_config(
             create: true,
             force_reinit: true,
             sync_writes: bin_cfg.chunk_sync_writes,
+            flusher_interval_ms: 50, // default; tune down for HFT testing
         };
         let ring = Arc::new(MmapRing::open(&ring_cfg)?);
 
@@ -229,7 +233,7 @@ pub async fn spawn_binance_from_config(
         let metrics_w = metrics.clone();
         tokio::spawn(async move {
             let mut last_vals: HashMap<String, (f64, f64)> = HashMap::new();
-            while let Some(snap) = chunk_rx.recv().await {
+            while let Some(mut snap) = chunk_rx.recv().await {
                 let key = snap.asset.clone();
                 let should_write = match last_vals.get(&key) {
                     Some(&(b, a)) => !(b == snap.bid && a == snap.ask),
@@ -238,14 +242,16 @@ pub async fn spawn_binance_from_config(
                 if should_write {
                     if let Ok(payload) = serde_json::to_vec(&snap) {
                         if let Ok(_seq) = ring_w.write_record(0u8, &payload) {
+                            // populate writer timestamp for local batch write
+                            snap.writer_ts_ms = Some(now_ms());
                             last_vals.insert(key, (snap.bid, snap.ask));
-                            // metrics
+                            // metrics - compute hop timings
                             let recv_ts = snap.recv_ts_ms as u64;
                             if let Some(ex_ts) = snap.exchange_ts_ms.map(|v| v as u64) {
-                                let write_ts = now_ms() as u64;
+                                let write_ts = snap.writer_ts_ms.unwrap() as u64;
                                 let hop_ex_recv = recv_ts.saturating_sub(ex_ts);
-                                let hop_recv_write = write_ts.saturating_sub(recv_ts);
-                                let total = write_ts.saturating_sub(ex_ts);
+                                let hop_recv_write = (write_ts as u64).saturating_sub(recv_ts);
+                                let total = (write_ts as u64).saturating_sub(ex_ts);
                                 metrics_w.record_snapshot_latency(
                                     hop_ex_recv,
                                     hop_recv_write,
@@ -253,8 +259,8 @@ pub async fn spawn_binance_from_config(
                                     payload.len() as u64,
                                 );
                             } else {
-                                let write_ts = now_ms() as u64;
-                                let hop_recv_write = write_ts.saturating_sub(recv_ts);
+                                let write_ts = snap.writer_ts_ms.unwrap() as u64;
+                                let hop_recv_write = (write_ts as u64).saturating_sub(recv_ts);
                                 metrics_w.record_snapshot_latency(
                                     0,
                                     hop_recv_write,
@@ -342,6 +348,7 @@ pub async fn spawn_binance_from_config(
             create: true,
             force_reinit: true,
             sync_writes: bin_cfg.chunk_sync_writes,
+            flusher_interval_ms: 50, // batch-flush interval for background flusher
         };
         let ring = Arc::new(MmapRing::open(&ring_cfg)?);
 
@@ -352,13 +359,13 @@ pub async fn spawn_binance_from_config(
         let metrics_w = metrics.clone();
         tokio::spawn(async move {
             // for trades we typically always write
-            while let Some(tp) = chunk_rx.recv().await {
+            while let Some(mut tp) = chunk_rx.recv().await {
                 if let Ok(payload) = serde_json::to_vec(&tp) {
-                    if let Err(e) = ring_w.write_record(1u8, &payload) {
-                        warn!(exchange=%ex, chunk=i, "trade chunk ring.write_record failed: {:?}", e);
-                    } else {
-                        // placeholder metric
+                    if let Ok(_seq) = ring_w.write_record(1u8, &payload) {
+                        tp.writer_ts_ms = Some(now_ms());
                         metrics_w.record_trade_latency(0, 0, 0, payload.len() as u64);
+                    } else {
+                        warn!(exchange=%ex, chunk=i, "trade chunk ring.write_record failed");
                     }
                 }
             }
@@ -405,17 +412,6 @@ pub async fn spawn_binance_from_config(
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------
-// chunked websocket readers
-// ---------------------------------------------------------------------
-
-// (Keep the previous logic of run_binance_book_stream_chunk and run_binance_trade_stream_chunk
-//  exactly as you had — omitted here for brevity — but ensure they remain in this file.)
-// For the compile drop-in, re-use your existing run_binance_book_stream_chunk and
-// run_binance_trade_stream_chunk implementations (they were correct originally).
-//
-// If your copy of this file lost those functions, re-add them from the version you previously ran.
 
 // ---------------------------------------------------------------------
 // chunked websocket readers
@@ -530,6 +526,7 @@ async fn run_binance_book_stream_chunk(
                                                         exchange_ts_ms: ts_opt,
                                                         event_u,
                                                         recv_ts_ms: recv_ts,
+                                                        writer_ts_ms: None,
                                                     };
                                                     // send to central consumers
                                                     if tx_snap.send(snap.clone()).is_err() {
@@ -684,6 +681,7 @@ async fn run_binance_trade_stream_chunk(
                                                             exchange_ts_ms: ts,
                                                             event_u,
                                                             recv_ts_ms: recv_ts,
+                                                            writer_ts_ms: None,
                                                         };
                                                         // send to central consumer
                                                         if tx_tr.send(tp.clone()).is_err() {
@@ -713,6 +711,7 @@ async fn run_binance_trade_stream_chunk(
                                                             exchange_ts_ms: ts,
                                                             event_u,
                                                             recv_ts_ms: recv_ts,
+                                                            writer_ts_ms: None,
                                                         };
                                                         if tx_tr.send(tp.clone()).is_err() {
                                                             warn!(exchange=%exchange, chunk=chunk_id,"tx_tr closed; stopping trade chunk stream");
